@@ -1,463 +1,726 @@
+import json
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from config import config
-from db import (
-    add_admin,
-    clear_cache,
-    is_admin,
+from app.config import settings
+from app.db import (
+    clear_membership_cache,
+    create_pending_request,
+    get_pending_request,
+    get_setting,
     list_source_chats,
     list_target_chats,
-    log_audit,
-    remove_admin,
-    set_source_enabled,
-    set_target_enabled,
+    remove_chat_from_processing,
+    set_setting,
+    update_pending_request_status,
     upsert_source_chat,
     upsert_target_chat,
+    write_audit,
 )
-from keyboards import admin_menu_keyboard, back_keyboard
-from services.membership import is_member_any_source
+from app.keyboards import (
+    BTN_CLEAR_CACHE,
+    BTN_COMMANDS,
+    BTN_DIAG,
+    BTN_MODE,
+    BTN_SETTINGS,
+    BTN_SOURCES,
+    BTN_TARGETS,
+    admin_menu_keyboard,
+)
+from app.services.owner_notify import (
+    notify_owner_chat_added,
+    notify_owner_pending_chat_request,
+)
+from app.services.permissions import require_admin
+from app.services.safe_send import safe_answer
 
 router = Router()
 
 
-def display_name(message: Message) -> str:
-    user = message.from_user
-    if not user:
-        return "unknown"
-
-    if user.username:
-        return f"@{user.username}"
-
-    return " ".join(x for x in [user.first_name, user.last_name] if x) or str(user.id)
+def _chat_title(message: Message) -> str:
+    return message.chat.title or getattr(message.chat, "full_name", None) or str(message.chat.id)
 
 
-async def require_admin_message(message: Message) -> bool:
-    if not message.from_user:
-        return False
-
-    ok = await is_admin(message.from_user.id)
-
-    if not ok:
-        if message.chat.type == "private":
-            await message.answer(
-                "Доступ запрещен.\n\n"
-                f"Ваш Telegram user_id: `{message.from_user.id}`",
-            )
-        return False
-
-    return True
-
-
-async def require_admin_callback(callback: CallbackQuery) -> bool:
-    if not callback.from_user:
-        return False
-
-    ok = await is_admin(callback.from_user.id)
-
-    if not ok:
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return False
-
-    return True
-
-
-def parse_arg_text(message: Message) -> str:
+def _command_arg(message: Message, command: str) -> str:
     text = message.text or ""
-    parts = text.split(maxsplit=1)
-    return parts[1].strip() if len(parts) > 1 else ""
+    return text.replace(command, "", 1).strip()
+
+
+def _mode_title(mode: str | None) -> str:
+    return mode or "soft"
+
+
+async def _register_source_now(message: Message, bot: Bot, title: str, mode: str) -> None:
+    assert message.from_user is not None
+
+    await upsert_source_chat(
+        chat_id=message.chat.id,
+        title=title,
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+    )
+
+    await clear_membership_cache()
+
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="source_chat_registered",
+        entity_type="source_chat",
+        entity_id=str(message.chat.id),
+        details={"title": title, "cache_cleared": True, "mode": mode},
+    )
+
+    if message.from_user.id != settings.owner_id:
+        await notify_owner_chat_added(
+            bot=bot,
+            actor=message.from_user,
+            chat=message.chat,
+            role="source",
+            mode=mode,
+        )
+
+    await safe_answer(message, 
+        "✅ Закрытая группа добавлена в обработку.\n\n"
+        f"Название: {title}\n"
+        f"Chat ID: {message.chat.id}\n\n"
+        "Кеш проверки пользователей очищен."
+    )
+
+
+async def _register_target_now(message: Message, bot: Bot, title: str, reaction: str, mode: str) -> None:
+    assert message.from_user is not None
+
+    await upsert_target_chat(
+        chat_id=message.chat.id,
+        title=title,
+        reaction=reaction,
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+    )
+
+    await clear_membership_cache()
+
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="target_chat_registered",
+        entity_type="target_chat",
+        entity_id=str(message.chat.id),
+        details={"title": title, "reaction": reaction, "cache_cleared": True, "mode": mode},
+    )
+
+    if message.from_user.id != settings.owner_id:
+        await notify_owner_chat_added(
+            bot=bot,
+            actor=message.from_user,
+            chat=message.chat,
+            role="target",
+            reaction=reaction,
+            mode=mode,
+        )
+
+    await safe_answer(message, 
+        "✅ Целевой чат добавлен в обработку.\n\n"
+        f"Название: {title}\n"
+        f"Chat ID: {message.chat.id}\n"
+        f"Реакция: {reaction}\n\n"
+        "Кеш проверки пользователей очищен."
+    )
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else 0
+async def start(message: Message) -> None:
+    if not message.from_user:
+        return
 
-    if await is_admin(user_id):
-        await message.answer(
-            "GP Verify запущен.\n\n"
-            "Вы администратор бота.\n"
-            "Откройте меню управления:",
-            reply_markup=admin_menu_keyboard(),
+    if not await require_admin(message.from_user):
+        await safe_answer(message, 
+            "Доступ к управлению ботом запрещен.\n\n"
+            f"Ваш Telegram user_id: {message.from_user.id}"
         )
-    else:
-        await message.answer(
-            "GP Verify работает.\n\n"
-            "Управление ботом доступно только владельцу и назначенным администраторам.\n\n"
-            f"Ваш Telegram user_id: `{user_id}`",
-        )
+        return
 
+    is_owner = message.from_user.id == settings.owner_id
 
-@router.message(Command("id"))
-async def cmd_id(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-
-    await message.answer(
-        "Идентификаторы:\n\n"
-        f"Ваш user_id: `{user_id}`\n"
-        f"chat_id этого чата: `{message.chat.id}`\n"
-        f"тип чата: `{message.chat.type}`",
+    await safe_answer(message, 
+        "Меню управления GP Verify:",
+        reply_markup=admin_menu_keyboard(is_owner=is_owner),
     )
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    if message.chat.type != "private":
-        await message.answer("Меню управления открывается в личном чате с ботом.")
-        return
-
-    await message.answer("Меню управления GP Verify:", reply_markup=admin_menu_keyboard())
-
-
-@router.message(Command("register_source"))
-async def cmd_register_source(message: Message, bot: Bot) -> None:
-    if not await require_admin_message(message):
-        return
-
-    if message.chat.type not in {"group", "supergroup"}:
-        await message.answer("Эту команду нужно выполнить внутри закрытой группы дома.")
-        return
-
-    title = parse_arg_text(message) or message.chat.title or str(message.chat.id)
-
-    me = await bot.get_me()
-    bot_member = await bot.get_chat_member(chat_id=message.chat.id, user_id=me.id)
-
-    if str(bot_member.status) not in {"administrator", "creator"}:
-        await message.answer("Бот должен быть администратором в этой ЗГ, иначе проверка участников может работать нестабильно.")
-        return
-
-    await upsert_source_chat(message.chat.id, title)
-    await log_audit(message.from_user.id, display_name(message), "register_source", f"{title} / {message.chat.id}")
-
-    await message.answer(
-        "ЗГ дома добавлена как источник проверки.\n\n"
-        f"Название: {title}\n"
-        f"chat_id: `{message.chat.id}`",
-    )
-
-
-@router.message(Command("register_target"))
-async def cmd_register_target(message: Message, bot: Bot) -> None:
-    if not await require_admin_message(message):
-        return
-
-    if message.chat.type not in {"group", "supergroup"}:
-        await message.answer("Эту команду нужно выполнить внутри чата, где бот должен ставить галочку.")
-        return
-
-    title = parse_arg_text(message) or message.chat.title or str(message.chat.id)
-
-    me = await bot.get_me()
-    bot_member = await bot.get_chat_member(chat_id=message.chat.id, user_id=me.id)
-
-    if str(bot_member.status) not in {"administrator", "creator"}:
-        await message.answer("Бот должен быть администратором в этом чате, чтобы стабильно видеть сообщения и ставить реакции.")
-        return
-
-    await upsert_target_chat(message.chat.id, title, config.DEFAULT_REACTION)
-    await log_audit(message.from_user.id, display_name(message), "register_target", f"{title} / {message.chat.id}")
-
-    await message.answer(
-        "Целевой чат добавлен.\n\n"
-        f"Название: {title}\n"
-        f"chat_id: `{message.chat.id}`\n"
-        f"Реакция: {config.DEFAULT_REACTION}",
-    )
-
-
-@router.message(Command("list_sources"))
-async def cmd_list_sources(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    rows = await list_source_chats()
-
-    if not rows:
-        await message.answer("ЗГ домов пока не добавлены.")
-        return
-
-    lines = ["ЗГ домов:"]
-    for row in rows:
-        mark = "✅" if row["enabled"] else "⛔"
-        lines.append(f'{mark} #{row["id"]} {row["title"]} `{row["chat_id"]}`')
-
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("list_targets"))
-async def cmd_list_targets(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    rows = await list_target_chats()
-
-    if not rows:
-        await message.answer("Целевые чаты пока не добавлены.")
-        return
-
-    lines = ["Целевые чаты:"]
-    for row in rows:
-        mark = "✅" if row["enabled"] else "⛔"
-        lines.append(f'{mark} #{row["id"]} {row["title"]} `{row["chat_id"]}` reaction={row["reaction"]}')
-
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("enable_source"))
-async def cmd_enable_source(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    arg = parse_arg_text(message)
-
-    if not arg.isdigit():
-        await message.answer("Формат: /enable_source ID")
-        return
-
-    ok = await set_source_enabled(int(arg), True)
-    await message.answer("ЗГ включена." if ok else "ЗГ с таким ID не найдена.")
-
-
-@router.message(Command("disable_source"))
-async def cmd_disable_source(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    arg = parse_arg_text(message)
-
-    if not arg.isdigit():
-        await message.answer("Формат: /disable_source ID")
-        return
-
-    ok = await set_source_enabled(int(arg), False)
-    await message.answer("ЗГ отключена." if ok else "ЗГ с таким ID не найдена.")
-
-
-@router.message(Command("enable_target"))
-async def cmd_enable_target(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    arg = parse_arg_text(message)
-
-    if not arg.isdigit():
-        await message.answer("Формат: /enable_target ID")
-        return
-
-    ok = await set_target_enabled(int(arg), True)
-    await message.answer("Целевой чат включен." if ok else "Целевой чат с таким ID не найден.")
-
-
-@router.message(Command("disable_target"))
-async def cmd_disable_target(message: Message) -> None:
-    if not await require_admin_message(message):
-        return
-
-    arg = parse_arg_text(message)
-
-    if not arg.isdigit():
-        await message.answer("Формат: /disable_target ID")
-        return
-
-    ok = await set_target_enabled(int(arg), False)
-    await message.answer("Целевой чат отключен." if ok else "Целевой чат с таким ID не найден.")
-
-
-@router.message(Command("add_admin"))
-async def cmd_add_admin(message: Message) -> None:
-    if not message.from_user or message.from_user.id != config.OWNER_ID:
-        await message.answer("Добавлять администраторов может только владелец бота.")
-        return
-
-    arg = parse_arg_text(message)
-
-    if not arg.isdigit():
-        await message.answer("Формат: /add_admin USER_ID")
-        return
-
-    await add_admin(int(arg))
-    await log_audit(message.from_user.id, display_name(message), "add_admin", arg)
-    await message.answer(f"Администратор добавлен: `{arg}`")
-
-
-@router.message(Command("remove_admin"))
-async def cmd_remove_admin(message: Message) -> None:
-    if not message.from_user or message.from_user.id != config.OWNER_ID:
-        await message.answer("Удалять администраторов может только владелец бота.")
-        return
-
-    arg = parse_arg_text(message)
-
-    if not arg.isdigit():
-        await message.answer("Формат: /remove_admin USER_ID")
-        return
-
-    if int(arg) == config.OWNER_ID:
-        await message.answer("Владельца нельзя удалить из администраторов.")
-        return
-
-    await remove_admin(int(arg))
-    await log_audit(message.from_user.id, display_name(message), "remove_admin", arg)
-    await message.answer(f"Администратор отключен: `{arg}`")
-
-
-@router.message(Command("test_me"))
-async def cmd_test_me(message: Message, bot: Bot) -> None:
+async def menu(message: Message) -> None:
     if not message.from_user:
         return
 
-    found = await is_member_any_source(bot, message.from_user.id, use_cache=False)
-
-    if found:
-        await message.answer("Вы найдены в одной из подключенных ЗГ домов. Ваши сообщения будут отмечаться ✅.")
-    else:
-        await message.answer("Вы не найдены в подключенных ЗГ домов.")
-
-
-@router.message(Command("clear_cache"))
-async def cmd_clear_cache(message: Message) -> None:
-    if not await require_admin_message(message):
+    if not await require_admin(message.from_user):
+        await safe_answer(message, 
+            "Доступ к управлению ботом запрещен.\n\n"
+            f"Ваш Telegram user_id: {message.from_user.id}"
+        )
         return
 
-    await clear_cache()
-    await log_audit(message.from_user.id, display_name(message), "clear_cache", "")
-    await message.answer("Кеш проверок очищен.")
+    is_owner = message.from_user.id == settings.owner_id
 
-
-@router.message(Command("diag"))
-async def cmd_diag(message: Message, bot: Bot) -> None:
-    if not await require_admin_message(message):
-        return
-
-    me = await bot.get_me()
-    sources = await list_source_chats()
-    targets = await list_target_chats()
-
-    await message.answer(
-        "Диагностика GP Verify:\n\n"
-        f"Бот: @{me.username}\n"
-        f"bot_id: `{me.id}`\n"
-        f"Текущий chat_id: `{message.chat.id}`\n"
-        f"Тип чата: `{message.chat.type}`\n"
-        f"ЗГ домов: {len(sources)}\n"
-        f"Целевые чаты: {len(targets)}\n"
-        f"Реакция по умолчанию: {config.DEFAULT_REACTION}\n"
-        f"Кеш, секунд: {config.CACHE_TTL_SECONDS}",
+    await safe_answer(message, 
+        "Меню управления GP Verify:",
+        reply_markup=admin_menu_keyboard(is_owner=is_owner),
     )
 
 
-@router.callback_query(F.data == "menu:main")
-async def cb_menu_main(callback: CallbackQuery) -> None:
-    if not await require_admin_callback(callback):
+@router.message(Command("mode"))
+async def show_mode(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
         return
 
-    await callback.message.edit_text("Меню управления GP Verify:", reply_markup=admin_menu_keyboard())
-    await callback.answer()
+    mode = await get_setting("admin_approval_mode", "soft")
+
+    await safe_answer(message, 
+        f"⚙️ Текущий режим управления: {mode}\n\n"
+        "Доступные режимы:\n\n"
+        "soft – мягкий режим.\n"
+        "Администратор может сразу добавить чат в обработку, "
+        "а владелец получает уведомление о действии.\n\n"
+        "strict – строгий режим.\n"
+        "Действия администратора требуют подтверждения владельца. "
+        "Администратор создает заявку, владелец подтверждает или отклоняет ее.\n\n"
+        "Команды переключения:\n"
+        "/mode_soft – включить мягкий режим\n"
+        "/mode_strict – включить строгий режим"
+    )
 
 
-@router.callback_query(F.data == "menu:sources")
-async def cb_menu_sources(callback: CallbackQuery) -> None:
-    if not await require_admin_callback(callback):
+@router.message(Command("mode_soft"))
+async def set_mode_soft(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
         return
 
-    rows = await list_source_chats()
+    await set_setting("admin_approval_mode", "soft")
 
-    if not rows:
-        text = "ЗГ домов пока не добавлены.\n\nДобавление выполняется командой в нужной закрытой группе:\n/register_source Дом 1"
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="admin_approval_mode_changed",
+        entity_type="settings",
+        entity_id="admin_approval_mode",
+        details={"mode": "soft"},
+    )
+
+    await safe_answer(message, "✅ Включен мягкий режим управления.")
+
+
+@router.message(Command("mode_strict"))
+async def set_mode_strict(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        return
+
+    await set_setting("admin_approval_mode", "strict")
+
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="admin_approval_mode_changed",
+        entity_type="settings",
+        entity_id="admin_approval_mode",
+        details={"mode": "strict"},
+    )
+
+    await safe_answer(message, 
+        "✅ Включен строгий режим управления.\n\n"
+        "Теперь добавление чатов администраторами будет требовать подтверждения владельца."
+    )
+
+
+@router.message(Command("register_source"))
+async def register_source(message: Message, bot: Bot) -> None:
+    if not message.from_user or not await require_admin(message.from_user):
+        return
+
+    if message.chat.type == "private":
+        await safe_answer(message, "Эту команду нужно выполнить в закрытой группе дома.")
+        return
+
+    title = _command_arg(message, "/register_source") or _chat_title(message)
+    mode = _mode_title(await get_setting("admin_approval_mode", "soft"))
+
+    if mode == "strict" and message.from_user.id != settings.owner_id:
+        request_id = await create_pending_request(
+            request_type="add_source_chat",
+            requested_by_user_id=message.from_user.id,
+            requested_by_username=message.from_user.username,
+            requested_by_full_name=message.from_user.full_name,
+            chat_id=message.chat.id,
+            chat_title=title,
+            chat_role="source",
+            payload={"title": title},
+        )
+
+        await write_audit(
+            actor_user_id=message.from_user.id,
+            actor_username=message.from_user.username,
+            actor_full_name=message.from_user.full_name,
+            action="source_chat_add_requested",
+            entity_type="source_chat",
+            entity_id=str(message.chat.id),
+            details={"request_id": request_id, "title": title},
+        )
+
+        await notify_owner_pending_chat_request(
+            bot=bot,
+            request_id=request_id,
+            actor=message.from_user,
+            chat=message.chat,
+            role="source",
+        )
+
+        await safe_answer(message, 
+            "🕓 Заявка на добавление закрытой группы отправлена владельцу."
+        )
+        return
+
+    await _register_source_now(message, bot, title, mode)
+
+
+@router.message(Command("register_target"))
+async def register_target(message: Message, bot: Bot) -> None:
+    if not message.from_user or not await require_admin(message.from_user):
+        return
+
+    if message.chat.type == "private":
+        await safe_answer(message, "Эту команду нужно выполнить в целевом чате.")
+        return
+
+    title = _command_arg(message, "/register_target") or _chat_title(message)
+    mode = _mode_title(await get_setting("admin_approval_mode", "soft"))
+    reaction = await get_setting("default_reaction", settings.default_reaction)
+    reaction = reaction or settings.default_reaction
+
+    if mode == "strict" and message.from_user.id != settings.owner_id:
+        request_id = await create_pending_request(
+            request_type="add_target_chat",
+            requested_by_user_id=message.from_user.id,
+            requested_by_username=message.from_user.username,
+            requested_by_full_name=message.from_user.full_name,
+            chat_id=message.chat.id,
+            chat_title=title,
+            chat_role="target",
+            payload={"title": title, "reaction": reaction},
+        )
+
+        await write_audit(
+            actor_user_id=message.from_user.id,
+            actor_username=message.from_user.username,
+            actor_full_name=message.from_user.full_name,
+            action="target_chat_add_requested",
+            entity_type="target_chat",
+            entity_id=str(message.chat.id),
+            details={"request_id": request_id, "title": title, "reaction": reaction},
+        )
+
+        await notify_owner_pending_chat_request(
+            bot=bot,
+            request_id=request_id,
+            actor=message.from_user,
+            chat=message.chat,
+            role="target",
+            reaction=reaction,
+        )
+
+        await safe_answer(message, 
+            "🕓 Заявка на добавление целевого чата отправлена владельцу."
+        )
+        return
+
+    await _register_target_now(message, bot, title, reaction, mode)
+
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("approve_req:"))
+async def approve_request(callback: CallbackQuery) -> None:
+    if not callback.from_user or callback.from_user.id != settings.owner_id:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    request_id = int(callback.data.split(":", 1)[1])
+    request = await get_pending_request(request_id)
+
+    if not request:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    if request["status"] != "pending":
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    payload = json.loads(request["payload_json"] or "{}")
+
+    if request["request_type"] == "add_source_chat":
+        await upsert_source_chat(
+            chat_id=int(request["chat_id"]),
+            title=payload.get("title") or request["chat_title"],
+            actor_user_id=int(request["requested_by_user_id"]),
+            actor_username=request["requested_by_username"],
+            actor_full_name=request["requested_by_full_name"],
+        )
+
+        action = "source_chat_request_approved"
+        entity_type = "source_chat"
+
+    elif request["request_type"] == "add_target_chat":
+        reaction = payload.get("reaction") or settings.default_reaction
+
+        await upsert_target_chat(
+            chat_id=int(request["chat_id"]),
+            title=payload.get("title") or request["chat_title"],
+            reaction=reaction,
+            actor_user_id=int(request["requested_by_user_id"]),
+            actor_username=request["requested_by_username"],
+            actor_full_name=request["requested_by_full_name"],
+        )
+
+        action = "target_chat_request_approved"
+        entity_type = "target_chat"
+
     else:
-        lines = ["ЗГ домов:"]
-        for row in rows:
-            mark = "✅" if row["enabled"] else "⛔"
-            lines.append(f'{mark} #{row["id"]} {row["title"]}')
-        text = "\n".join(lines)
-
-    await callback.message.edit_text(text, reply_markup=back_keyboard())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:targets")
-async def cb_menu_targets(callback: CallbackQuery) -> None:
-    if not await require_admin_callback(callback):
+        await callback.answer("Неизвестный тип заявки.", show_alert=True)
         return
 
-    rows = await list_target_chats()
+    await clear_membership_cache()
 
-    if not rows:
-        text = "Целевые чаты пока не добавлены.\n\nДобавление выполняется командой в нужном чате:\n/register_target Общий чат"
-    else:
-        lines = ["Целевые чаты:"]
-        for row in rows:
-            mark = "✅" if row["enabled"] else "⛔"
-            lines.append(f'{mark} #{row["id"]} {row["title"]} {row["reaction"]}')
-        text = "\n".join(lines)
+    await update_pending_request_status(
+        request_id=request_id,
+        status="approved",
+        resolved_by_user_id=callback.from_user.id,
+    )
 
-    await callback.message.edit_text(text, reply_markup=back_keyboard())
-    await callback.answer()
+    await write_audit(
+        actor_user_id=callback.from_user.id,
+        actor_username=callback.from_user.username,
+        actor_full_name=callback.from_user.full_name,
+        action=action,
+        entity_type=entity_type,
+        entity_id=str(request["chat_id"]),
+        details={
+            "request_id": request_id,
+            "requested_by_user_id": request["requested_by_user_id"],
+            "cache_cleared": True,
+        },
+    )
+
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ Заявка одобрена.\n\n"
+            f"Чат: {request['chat_title']}\n"
+            f"Chat ID: {request['chat_id']}\n"
+            "Кеш проверки пользователей очищен."
+        )
+
+    await callback.answer("Заявка одобрена.")
 
 
-@router.callback_query(F.data == "menu:commands")
-async def cb_menu_commands(callback: CallbackQuery) -> None:
-    if not await require_admin_callback(callback):
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("reject_req:"))
+async def reject_request(callback: CallbackQuery) -> None:
+    if not callback.from_user or callback.from_user.id != settings.owner_id:
+        await callback.answer("Недостаточно прав.", show_alert=True)
         return
+
+    request_id = int(callback.data.split(":", 1)[1])
+    request = await get_pending_request(request_id)
+
+    if not request:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    if request["status"] != "pending":
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    await update_pending_request_status(
+        request_id=request_id,
+        status="rejected",
+        resolved_by_user_id=callback.from_user.id,
+    )
+
+    await write_audit(
+        actor_user_id=callback.from_user.id,
+        actor_username=callback.from_user.username,
+        actor_full_name=callback.from_user.full_name,
+        action="pending_request_rejected",
+        entity_type=request["chat_role"],
+        entity_id=str(request["chat_id"]),
+        details={
+            "request_id": request_id,
+            "request_type": request["request_type"],
+            "requested_by_user_id": request["requested_by_user_id"],
+        },
+    )
+
+    if callback.message:
+        await callback.message.edit_text(
+            "❌ Заявка отклонена.\n\n"
+            f"Чат: {request['chat_title']}\n"
+            f"Chat ID: {request['chat_id']}"
+        )
+
+    await callback.answer("Заявка отклонена.")
+
+
+@router.message(Command("sources"))
+async def show_sources(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        return
+
+    chats = await list_source_chats()
+
+    if not chats:
+        await safe_answer(message, "Закрытые группы домов не добавлены.")
+        return
+
+    lines = ["🏠 Закрытые группы домов:\n"]
+
+    for chat in chats:
+        status = "✅" if chat["enabled"] else "⛔"
+        lines.append(
+            f"{status} ID базы: {chat['id']}\n"
+            f"Название: {chat['title']}\n"
+            f"Chat ID: {chat['chat_id']}\n"
+            f"Исключить: /remove_source_{chat['id']}\n"
+        )
+
+    await safe_answer(message, "\n".join(lines))
+
+
+@router.message(Command("targets"))
+async def show_targets(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        return
+
+    chats = await list_target_chats()
+
+    if not chats:
+        await safe_answer(message, "Целевые чаты не добавлены.")
+        return
+
+    lines = ["💬 Целевые чаты:\n"]
+
+    for chat in chats:
+        status = "✅" if chat["enabled"] else "⛔"
+        lines.append(
+            f"{status} ID базы: {chat['id']}\n"
+            f"Название: {chat['title']}\n"
+            f"Chat ID: {chat['chat_id']}\n"
+            f"Реакция: {chat['reaction']}\n"
+            f"Исключить: /remove_target_{chat['id']}\n"
+        )
+
+    await safe_answer(message, "\n".join(lines))
+
+
+@router.message(lambda message: message.text and message.text.startswith("/remove_source_"))
+async def remove_source(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        return
+
+    raw_id = message.text.replace("/remove_source_", "", 1).strip()
+
+    if not raw_id.isdigit():
+        await safe_answer(message, "Некорректный ID.")
+        return
+
+    chat_db_id = int(raw_id)
+
+    chat = await remove_chat_from_processing(
+        table="source_chats",
+        chat_db_id=chat_db_id,
+        actor_user_id=message.from_user.id,
+        reason="removed_by_owner",
+    )
+
+    if not chat:
+        await safe_answer(message, "Чат не найден.")
+        return
+
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="source_chat_removed_from_processing",
+        entity_type="source_chat",
+        entity_id=str(chat_db_id),
+        details={
+            "chat_id": chat["chat_id"],
+            "title": chat["title"],
+            "cache_cleared": True,
+        },
+    )
+
+    await safe_answer(message, 
+        "⛔ Закрытая группа исключена из обработки.\n\n"
+        f"Название: {chat['title']}\n"
+        f"Chat ID: {chat['chat_id']}\n"
+        "Кеш проверки пользователей очищен."
+    )
+
+
+@router.message(lambda message: message.text and message.text.startswith("/remove_target_"))
+async def remove_target(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        return
+
+    raw_id = message.text.replace("/remove_target_", "", 1).strip()
+
+    if not raw_id.isdigit():
+        await safe_answer(message, "Некорректный ID.")
+        return
+
+    chat_db_id = int(raw_id)
+
+    chat = await remove_chat_from_processing(
+        table="target_chats",
+        chat_db_id=chat_db_id,
+        actor_user_id=message.from_user.id,
+        reason="removed_by_owner",
+    )
+
+    if not chat:
+        await safe_answer(message, "Чат не найден.")
+        return
+
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="target_chat_removed_from_processing",
+        entity_type="target_chat",
+        entity_id=str(chat_db_id),
+        details={
+            "chat_id": chat["chat_id"],
+            "title": chat["title"],
+            "cache_cleared": True,
+        },
+    )
+
+    await safe_answer(message, 
+        "⛔ Целевой чат исключен из обработки.\n\n"
+        f"Название: {chat['title']}\n"
+        f"Chat ID: {chat['chat_id']}\n"
+        "Кеш проверки пользователей очищен."
+    )
+
+@router.message(F.text == BTN_SOURCES)
+async def menu_sources(message: Message) -> None:
+    await show_sources(message)
+
+
+@router.message(F.text == BTN_TARGETS)
+async def menu_targets(message: Message) -> None:
+    await show_targets(message)
+
+
+@router.message(F.text == BTN_MODE)
+async def menu_mode(message: Message) -> None:
+    await show_mode(message)
+
+
+@router.message(F.text == BTN_CLEAR_CACHE)
+async def menu_clear_cache(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        await safe_answer(message, "Очистка кеша доступна только владельцу бота.")
+        return
+
+    await clear_membership_cache()
+
+    await write_audit(
+        actor_user_id=message.from_user.id,
+        actor_username=message.from_user.username,
+        actor_full_name=message.from_user.full_name,
+        action="membership_cache_cleared",
+        entity_type="cache",
+        entity_id="membership_cache",
+        details={"source": "owner_menu"},
+    )
+
+    await safe_answer(message, "✅ Кеш проверки пользователей очищен.")
+
+
+@router.message(F.text == BTN_SETTINGS)
+async def menu_settings(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.owner_id:
+        await safe_answer(message, "Настройки доступны только владельцу бота.")
+        return
+
+    mode = await get_setting("admin_approval_mode", "soft")
+    reaction = await get_setting("default_reaction", settings.default_reaction)
+
+    await safe_answer(message, 
+        "⚙️ Текущие настройки GP Verify:\n\n"
+        f"Режим управления: {mode}\n"
+        f"Реакция: {reaction}\n"
+        f"Кеш проверки: {settings.cache_ttl_minutes} минут\n\n"
+        "Переключение режима:\n"
+        "/mode_soft – мягкий режим\n"
+        "/mode_strict – строгий режим\n\n"
+        "Списки чатов:\n"
+        "/sources – ЗГ домов\n"
+        "/targets – целевые чаты"
+    )
+
+
+@router.message(F.text == BTN_DIAG)
+async def menu_diag(message: Message) -> None:
+    if not message.from_user or not await require_admin(message.from_user):
+        return
+
+    mode = await get_setting("admin_approval_mode", "soft")
+    reaction = await get_setting("default_reaction", settings.default_reaction)
+
+    await safe_answer(message, 
+        "🧪 Базовая диагностика:\n\n"
+        f"Бот запущен: да\n"
+        f"Ваш user_id: {message.from_user.id}\n"
+        f"Роль: {'owner' if message.from_user.id == settings.owner_id else 'admin'}\n"
+        f"Режим управления: {mode}\n"
+        f"Реакция: {reaction}\n\n"
+        "Для проверки подключенных чатов используйте:\n"
+        "/sources\n"
+        "/targets"
+    )
+
+
+@router.message(F.text == BTN_COMMANDS)
+async def menu_commands(message: Message) -> None:
+    if not message.from_user or not await require_admin(message.from_user):
+        return
+
+    is_owner = message.from_user.id == settings.owner_id
 
     text = (
-        "Основные команды:\n\n"
-        "/menu – меню управления\n"
-        "/id – показать user_id и chat_id\n"
-        "/register_source Дом 1 – добавить текущую ЗГ дома\n"
-        "/register_target Общий чат – добавить целевой чат\n"
-        "/list_sources – список ЗГ\n"
-        "/list_targets – список целевых чатов\n"
-        "/enable_source ID – включить ЗГ\n"
-        "/disable_source ID – отключить ЗГ\n"
-        "/enable_target ID – включить целевой чат\n"
-        "/disable_target ID – отключить целевой чат\n"
-        "/test_me – проверить себя\n"
-        "/diag – диагностика\n"
-        "/clear_cache – очистить кеш\n\n"
-        "Только владелец:\n"
-        "/add_admin USER_ID\n"
-        "/remove_admin USER_ID"
+        "📋 Команды GP Verify:\n\n"
+        "Общие команды:\n"
+        "/start – открыть меню\n"
+        "/menu – открыть меню\n"
+        "/register_source Название – добавить текущий чат как ЗГ дома\n"
+        "/register_target Название – добавить текущий чат как целевой\n"
+        "/sources – список ЗГ домов\n"
+        "/targets – список целевых чатов\n"
     )
 
-    await callback.message.edit_text(text, reply_markup=back_keyboard())
-    await callback.answer()
+    if is_owner:
+        text += (
+            "\nКоманды владельца:\n"
+            "/mode – показать режим управления\n"
+            "/mode_soft – включить мягкий режим\n"
+            "/mode_strict – включить строгий режим\n"
+            "/remove_source_ID – исключить ЗГ из обработки\n"
+            "/remove_target_ID – исключить целевой чат из обработки\n"
+        )
 
-
-@router.callback_query(F.data == "menu:diag")
-async def cb_menu_diag(callback: CallbackQuery, bot: Bot) -> None:
-    if not await require_admin_callback(callback):
-        return
-
-    me = await bot.get_me()
-    sources = await list_source_chats()
-    targets = await list_target_chats()
-
-    text = (
-        "Диагностика GP Verify:\n\n"
-        f"Бот: @{me.username}\n"
-        f"bot_id: {me.id}\n"
-        f"ЗГ домов: {len(sources)}\n"
-        f"Целевые чаты: {len(targets)}\n"
-        f"Реакция: {config.DEFAULT_REACTION}\n"
-        f"Кеш: {config.CACHE_TTL_SECONDS} сек."
-    )
-
-    await callback.message.edit_text(text, reply_markup=back_keyboard())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:clear_cache")
-async def cb_menu_clear_cache(callback: CallbackQuery) -> None:
-    if not await require_admin_callback(callback):
-        return
-
-    await clear_cache()
-    await log_audit(callback.from_user.id, callback.from_user.full_name, "clear_cache", "from menu")
-
-    await callback.message.edit_text("Кеш проверок очищен.", reply_markup=back_keyboard())
-    await callback.answer("Готово")
+    await safe_answer(message, text)

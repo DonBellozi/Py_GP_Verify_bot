@@ -1,50 +1,61 @@
-import logging
-
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-from db import (
-    get_active_source_chats,
-    get_membership_cache,
-    set_membership_cache,
+from app.config import settings
+from app.db import (
+    get_active_source_chat_ids,
+    get_cached_membership,
+    set_cached_membership,
+    write_event,
 )
 
-logger = logging.getLogger(__name__)
-
-GOOD_STATUSES = {"creator", "administrator", "member"}
+VERIFIED_STATUSES = {"creator", "administrator", "member"}
 
 
-async def is_member_any_source(bot: Bot, user_id: int, use_cache: bool = True) -> bool:
-    if use_cache:
-        cached = await get_membership_cache(user_id)
-        if cached is not None:
-            return cached
+async def is_user_verified(bot: Bot, user_id: int) -> bool:
+    cached = await get_cached_membership(user_id)
 
-    sources = await get_active_source_chats()
+    if cached is not None:
+        return cached
 
-    if not sources:
-        await set_membership_cache(user_id, False)
+    source_chat_ids = await get_active_source_chat_ids()
+
+    if not source_chat_ids:
+        await set_cached_membership(
+            user_id=user_id,
+            is_verified=False,
+            ttl_minutes=settings.cache_ttl_minutes,
+        )
         return False
 
-    found = False
+    is_verified = False
 
-    for source in sources:
-        chat_id = source["chat_id"]
-
+    for source_chat_id in source_chat_ids:
         try:
-            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-            status = str(member.status)
+            member = await bot.get_chat_member(
+                chat_id=source_chat_id,
+                user_id=user_id,
+            )
 
-            if status in GOOD_STATUSES:
-                found = True
+            if member.status in VERIFIED_STATUSES:
+                is_verified = True
                 break
 
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
-            logger.warning("Cannot check user %s in source chat %s: %s", user_id, chat_id, exc)
-            continue
-        except Exception as exc:
-            logger.exception("Unexpected error while checking user %s in source chat %s: %s", user_id, chat_id, exc)
+            await write_event(
+                target_chat_id=source_chat_id,
+                message_id=None,
+                user_id=user_id,
+                is_verified=None,
+                action="get_chat_member_failed",
+                error=str(exc),
+            )
             continue
 
-    await set_membership_cache(user_id, found)
-    return found
+    await set_cached_membership(
+        user_id=user_id,
+        is_verified=is_verified,
+        ttl_minutes=settings.cache_ttl_minutes,
+    )
+
+    return is_verified

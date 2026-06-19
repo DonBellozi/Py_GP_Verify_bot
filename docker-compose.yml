@@ -4,7 +4,7 @@ services:
     container_name: gp-verify-bot
     restart: unless-stopped
     network_mode: host
-    working_dir: /app
+    working_dir: /code
     env_file:
       - .env
     environment:
@@ -12,12 +12,13 @@ services:
       - PIP_DEFAULT_TIMEOUT=180
       - PIP_RETRIES=20
       - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/code
     volumes:
-      - ./app:/app
-      - ./requirements.txt:/app/requirements.txt:ro
+      - ./app:/code/app
+      - ./requirements.txt:/code/requirements.txt:ro
       - ./data:/data
       - ./logs:/logs
     command: >
-        sh -c "python -m pip install --upgrade pip --root-user-action=ignore &&
-        python -m pip install --no-cache-dir --timeout 180 --retries 20 --root-user-action=ignore -r /app/requirements.txt &&
-        python main.py"
+      sh -c "python -m pip install --upgrade pip --root-user-action=ignore &&
+      python -m pip install --no-cache-dir --timeout 180 --retries 20 --root-user-action=ignore -r /code/requirements.txt &&
+      python -m app.main"

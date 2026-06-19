@@ -1,37 +1,39 @@
 import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
-    OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
-
-    DB_PATH: str = os.getenv("DB_PATH", "/data/bot.sqlite3")
-    LOG_PATH: str = os.getenv("LOG_PATH", "/logs/bot.log")
-
-    DEFAULT_REACTION: str = os.getenv("DEFAULT_REACTION", "✅")
-    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "900"))
-
-    ADMIN_IDS_RAW: str = os.getenv("ADMIN_IDS", "").strip()
-
-    @property
-    def admin_ids(self) -> set[int]:
-        result = {self.OWNER_ID}
-
-        if self.ADMIN_IDS_RAW:
-            for item in self.ADMIN_IDS_RAW.split(","):
-                item = item.strip()
-                if item.isdigit():
-                    result.add(int(item))
-
-        return result
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    owner_id: int
+    db_path: str
+    cache_ttl_minutes: int
+    default_reaction: str
+    admin_approval_mode: str
 
 
-config = Config()
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
-def validate_config() -> None:
-    if not config.BOT_TOKEN or config.BOT_TOKEN == "PASTE_BOT_TOKEN_HERE":
-        raise RuntimeError("BOT_TOKEN is not set")
-
-    if not config.OWNER_ID:
-        raise RuntimeError("OWNER_ID is not set")
+settings = Settings(
+    bot_token=os.getenv("BOT_TOKEN", ""),
+    owner_id=_int_env("OWNER_ID", 0),
+    db_path=os.getenv("DB_PATH", "./data/bot.sqlite3"),
+    cache_ttl_minutes=_int_env("CACHE_TTL_MINUTES", 30),
+    default_reaction=os.getenv("DEFAULT_REACTION", "👌"),
+    # Режим управления администраторами:
+    # soft   - админы выполняют действия сразу, owner получает уведомления
+    # strict - действия админов требуют подтверждения owner
+    admin_approval_mode=os.getenv("ADMIN_APPROVAL_MODE", "soft"),
+)

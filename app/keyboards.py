@@ -1,27 +1,44 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+
+BTN_SOURCES = "🏠 ЗГ домов"
+BTN_TARGETS = "💬 Целевые чаты"
+BTN_DIAG = "🧪 Диагностика"
+BTN_CLEAR_CACHE = "🧹 Очистить кеш"
+BTN_COMMANDS = "📋 Команды"
+BTN_MODE = "🔐 Режим доступа"
+BTN_SETTINGS = "⚙️ Настройки"
 
 
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def admin_menu_keyboard(*, is_owner: bool) -> ReplyKeyboardMarkup:
+    buttons = [
+        [
+            KeyboardButton(text=BTN_SOURCES),
+            KeyboardButton(text=BTN_TARGETS),
+        ],
+        [
+            KeyboardButton(text=BTN_DIAG),
+            KeyboardButton(text=BTN_COMMANDS),
+        ],
+    ]
+
+    if is_owner:
+        buttons.insert(
+            1,
             [
-                InlineKeyboardButton(text="🏠 ЗГ домов", callback_data="menu:sources"),
-                InlineKeyboardButton(text="💬 Целевые чаты", callback_data="menu:targets"),
+                KeyboardButton(text=BTN_MODE),
+                KeyboardButton(text=BTN_SETTINGS),
             ],
-            [
-                InlineKeyboardButton(text="🧪 Диагностика", callback_data="menu:diag"),
-                InlineKeyboardButton(text="🧹 Очистить кеш", callback_data="menu:clear_cache"),
-            ],
-            [
-                InlineKeyboardButton(text="📋 Команды", callback_data="menu:commands"),
-            ],
-        ]
-    )
+        )
 
+        buttons.insert(
+            2,
+            [
+                KeyboardButton(text=BTN_CLEAR_CACHE),
+            ],
+        )
 
-def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Назад", callback_data="menu:main")]
-        ]
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие",
     )
