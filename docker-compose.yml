@@ -1,24 +1,38 @@
 services:
   gp-verify-bot:
-    image: python:3.12-slim
+    build:
+      context: .
+      network: host
+
     container_name: gp-verify-bot
     restart: unless-stopped
     network_mode: host
+
     working_dir: /code
+
     env_file:
       - .env
+
     environment:
-      - PIP_INDEX_URL=https://pypi.org/simple
-      - PIP_DEFAULT_TIMEOUT=180
-      - PIP_RETRIES=20
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/code
+
+    dns:
+      - 100.127.255.1
+
+    dns_opt:
+      - timeout:2
+      - attempts:2
+
     volumes:
       - ./app:/code/app
-      - ./requirements.txt:/code/requirements.txt:ro
       - ./data:/data
       - ./logs:/logs
-    command: >
-      sh -c "python -m pip install --upgrade pip --root-user-action=ignore &&
-      python -m pip install --no-cache-dir --timeout 180 --retries 20 --root-user-action=ignore -r /code/requirements.txt &&
-      python -m app.main"
+
+    command: ["python", "-m", "app.main"]
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

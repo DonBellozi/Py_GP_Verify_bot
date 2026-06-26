@@ -140,6 +140,11 @@ async def init_db() -> None:
         )
 
         # Мягкая миграция для уже созданных тестовых БД.
+        await _ensure_column(db, "bot_admins", "created_by_user_id", "INTEGER")
+        await _ensure_column(db, "bot_admins", "updated_at", "TEXT")
+        await _ensure_column(db, "bot_admins", "disabled_by_user_id", "INTEGER")
+        await _ensure_column(db, "bot_admins", "disabled_at", "TEXT")
+
         await _ensure_column(db, "source_chats", "removed_from_processing", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "source_chats", "removed_by_user_id", "INTEGER")
         await _ensure_column(db, "source_chats", "removed_at", "TEXT")
@@ -739,3 +744,155 @@ async def update_pending_request_status(
             ),
         )
         await db.commit()
+
+async def upsert_bot_admin(
+    *,
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    actor_user_id: int,
+) -> None:
+    async with aiosqlite.connect(settings.db_path) as db:
+        ts = now_iso()
+        await db.execute(
+            """
+            INSERT INTO bot_admins (
+                user_id,
+                username,
+                full_name,
+                role,
+                enabled,
+                created_at,
+                created_by_user_id,
+                updated_at
+            )
+            VALUES (?, ?, ?, 'admin', 1, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, bot_admins.username),
+                full_name = COALESCE(excluded.full_name, bot_admins.full_name),
+                enabled = 1,
+                updated_at = excluded.updated_at,
+                disabled_by_user_id = NULL,
+                disabled_at = NULL
+            """,
+            (
+                user_id,
+                username,
+                full_name,
+                ts,
+                actor_user_id,
+                ts,
+            ),
+        )
+        await db.commit()
+
+
+async def update_bot_admin_profile(
+    *,
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+) -> None:
+    async with aiosqlite.connect(settings.db_path) as db:
+        await db.execute(
+            """
+            UPDATE bot_admins
+            SET
+                username = COALESCE(?, username),
+                full_name = COALESCE(?, full_name),
+                updated_at = ?
+            WHERE user_id = ?
+              AND enabled = 1
+            """,
+            (
+                username,
+                full_name,
+                now_iso(),
+                user_id,
+            ),
+        )
+        await db.commit()
+
+
+async def get_bot_admin(user_id: int) -> dict[str, Any] | None:
+    async with aiosqlite.connect(settings.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT user_id, username, full_name, role, enabled, created_at, created_by_user_id, updated_at
+            FROM bot_admins
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def list_bot_admins(*, enabled_only: bool = True) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(settings.db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        where = "WHERE enabled = 1" if enabled_only else ""
+
+        cursor = await db.execute(
+            f"""
+            SELECT user_id, username, full_name, role, enabled, created_at, created_by_user_id, updated_at
+            FROM bot_admins
+            {where}
+            ORDER BY
+                CASE WHEN full_name IS NULL OR full_name = '' THEN 1 ELSE 0 END,
+                full_name,
+                user_id
+            """
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def remove_bot_admin(
+    *,
+    user_id: int,
+    actor_user_id: int,
+) -> dict[str, Any] | None:
+    async with aiosqlite.connect(settings.db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            """
+            SELECT user_id, username, full_name, role, enabled, created_at, created_by_user_id, updated_at
+            FROM bot_admins
+            WHERE user_id = ?
+              AND enabled = 1
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        admin = dict(row)
+        ts = now_iso()
+
+        await db.execute(
+            """
+            UPDATE bot_admins
+            SET
+                enabled = 0,
+                disabled_by_user_id = ?,
+                disabled_at = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                actor_user_id,
+                ts,
+                ts,
+                user_id,
+            ),
+        )
+        await db.commit()
+
+        return admin
+
